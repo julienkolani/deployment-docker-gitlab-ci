@@ -1,0 +1,144 @@
+image: debian:stable-slim
+
+variables: 
+      DEV_SERVER_IP: "ip"
+      DEV_COMPOSE_DIR: "/home/deploy-admin/deployment_app/demarcheur"
+      DEV_SSH_PORT: "22"
+      DEV_SSH_USER: deploy-admin
+
+      PROD_DEPLOY_IP: "ip"
+      PROD_COMPOSE_DIR: "/home/deploy-admin/deployment_app/demarcheur"
+      PROD_SSH_PORT: "22"
+      PROD_SSH_USER: deploy-admin
+
+      UPDATE_SCRIPT_DEV: update_api_dev.sh
+
+      UPDATE_SCRIPT_PROD: update_api_prod.sh
+
+      CI_REGISTRY : ""
+      CI_REGISTRY_PASSWORD: ""
+
+
+# Définition des étapes du pipeline
+stages:
+  - checks
+  - package
+  - delivery
+  - cleanup
+
+# Définition des règles de réessai pour les échecs
+.when2retry:
+  retry:
+    max: 2
+    when:
+      - stuck_or_timeout_failure
+      - runner_system_failure
+
+# Règles pour la phase de vérification
+.when2checkbuild:
+  rules:
+    - if: ($CI_COMMIT_REF_NAME == "master" || $CI_COMMIT_REF_NAME == "develop-master" || $CI_COMMIT_REF_NAME == "main" || $CI_COMMIT_TAG) || ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop-master" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")
+
+# Règles pour la phase de paquetage
+.when2package:
+  rules:
+    - if: ($CI_COMMIT_REF_NAME == "master" || $CI_COMMIT_REF_NAME == "develop-master" || $CI_COMMIT_REF_NAME == "main" || $CI_COMMIT_TAG)
+    - if: $CI_MERGE_REQUEST_ID
+      when: never
+
+# Règles pour la livraison sur l'environnement de développement
+.when2delive2dev:
+  rules:
+    - if: ($CI_COMMIT_REF_NAME == "develop-master")
+    - if: "$CI_MERGE_REQUEST_ID"
+      when: never
+
+# Règles pour la livraison sur l'environnement de production
+.when2delive2prod:
+  rules:
+    - if: ($CI_COMMIT_REF_NAME == "master" || $CI_COMMIT_REF_NAME == "main")
+      when: manual
+    - if: "$CI_MERGE_REQUEST_ID"
+      when: never
+
+# Étape de vérification
+checkbuild:
+  extends:
+    - .when2checkbuild
+    - .when2retry
+  stage: checks
+  tags:
+    - shell
+  script:
+    - DOCKER_BUILDKIT=1 docker build --pull -t ${CI_REGISTRY_IMAGE}:${CI_JOB_ID} . --target check --progress plain
+    - docker rmi ${CI_REGISTRY_IMAGE}:${CI_JOB_ID}
+
+# Étape de construction du conteneur
+containerize:
+  extends:
+    - .when2package
+    - .when2retry
+  stage: package
+  needs: ["checkbuild"]
+  tags:
+    - shell
+  script:
+    - DOCKER_BUILDKIT=1 docker build --pull -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG:-$CI_COMMIT_BRANCH} . --target containerize --progress plain
+    - docker login $CI_REGISTRY -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD
+    - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG:-$CI_COMMIT_BRANCH}
+    - docker logout $CI_REGISTRY
+    - docker rmi ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG:-$CI_COMMIT_BRANCH}
+    - docker image prune -f
+
+# Étape de livraison sur l'environnement de production (commentée pour éviter l'exécution non désirée)
+deliver2prod:
+  extends:
+    - .when2retry
+    - .when2delive2prod
+  stage: delivery
+  needs:
+    - containerize
+  variables:
+    GIT_STRATEGY: none
+  tags:
+    - shell
+  before_script:
+    - which ssh-agent || (apt update && apt install openssh-client -y)
+    - eval $(ssh-agent -s)
+    - echo "$PROD_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - ssh -p $PROD_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $PROD_SSH_USER@$PROD_SSH_SERVER "cd $PROD_SSH_COMPOSE_DIR; bash $UPDATE_SCRIPT_PROD"
+
+# Étape de livraison sur l'environnement de développement (commentée pour éviter l'exécution non désirée)
+deliver2dev:
+  extends:
+    - .when2delive2dev
+    - .when2retry
+  stage: delivery
+  needs:
+    - containerize
+  variables:
+    GIT_STRATEGY: none
+  tags:
+    - shell
+  before_script:
+    - which ssh-agent || (apt update && apt install openssh-client -y)
+    - eval $(ssh-agent -s)
+    - echo "$DEV_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+  script:
+    - ssh -p $DEV_SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null $DEV_SSH_USER@$DEV_SSH_SERVER_IP "cd $DEV_SSH_COMPOSE_DIR; bash $UPDATE_SCRIPT_DEV"
+
+# Étape de nettoyage des fichiers
+cleanup_files:
+  extends:
+    - .when2package
+    - .when2retry
+  stage: cleanup
+  tags:
+    - shell
+  script:
+    - rm -rf $CI_PROJECT_DIR
